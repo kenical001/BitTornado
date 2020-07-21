@@ -10,6 +10,13 @@ import random
 import socket
 import hashlib
 import threading
+
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+import json
+from gi.repository import GLib
+
 from BitTornado.Client.download_bt1 import BT1Download, defaults, \
     parse_params, get_usage, get_metainfo
 from BitTornado.Network.RawServer import RawServer
@@ -94,18 +101,18 @@ class HeadlessDisplayer:
                 ''.format(statistics.numPeers,
                           statistics.percentDone / 100,
                           float(statistics.torrentRate) / (1 << 10))
-        print('\n\n\n\n')
+        #print('\n\n\n\n')
         for err in self.errors:
             print('ERROR:\n' + err + '\n')
-        print('saving:        ', self.file)
-        print('percent done:  ', self.percentDone)
-        print('time left:     ', self.timeEst)
-        print('download to:   ', self.downloadTo)
-        print('download rate: ', self.downRate)
-        print('upload rate:   ', self.upRate)
-        print('share rating:  ', self.shareRating)
-        print('seed status:   ', self.seedStatus)
-        print('peer status:   ', self.peerStatus)
+        #print('saving:        ', self.file)
+        #print('percent done:  ', self.percentDone)
+        #print('time left:     ', self.timeEst)
+        #print('download to:   ', self.downloadTo)
+        #print('download rate: ', self.downRate)
+        #print('upload rate:   ', self.upRate)
+        #print('share rating:  ', self.shareRating)
+        #print('seed status:   ', self.seedStatus)
+        #print('peer status:   ', self.peerStatus)
         sys.stdout.flush()
         dpflag.set()
 
@@ -119,91 +126,137 @@ class HeadlessDisplayer:
     def newpath(self, path):
         self.downloadTo = path
 
+class GSDbusBTDownload(dbus.service.Object):
+    def __init__(self, name, session, displayer):
+        # export this object to dbus
+        dbus.service.Object.__init__(self, name, session)
+        self.displayer = displayer
+
+
+    @dbus.service.method("com.gsidv.btdownload", in_signature='', out_signature='s')
+    def GetBTDownloadStatus(self):
+        print("GetBTDownloadStatus")
+        status = {}
+        status["percent"] = self.displayer.percentDone
+        status["process"] = self.displayer.timeEst
+        status["done"] = self.displayer.done
+        return json.dumps(status)
+        
+
+class DownloadThread(threading.Thread):
+    def __init__(self, params, displayer):
+        threading.Thread.__init__(self)
+        self.params = params
+        self.displayer = displayer
+        print("Download init")
+
+    def run(self):
+        h = self.displayer
+        params = self.params
+        while 1:
+            configdir = ConfigDir('downloadheadless')
+            defaultsToIgnore = ['metafile', 'url', 'priority']
+            configdir.setDefaults(defaults, defaultsToIgnore)
+            configdefaults = configdir.loadConfig()
+            defaults.append(
+                ('save_options', 0, 'whether to save the current options as the '
+                'new default configuration (only for btdownloadheadless.py)'))
+            try:
+                config = parse_params(params, configdefaults)
+            except ValueError as e:
+                print('error: {}\n'.format(e),
+                    'run with no args for parameter explanations')
+                break
+            if not config:
+                print(get_usage(defaults, 80, configdefaults))
+                break
+            if config['save_options']:
+                configdir.saveConfig(config)
+            configdir.deleteOldCacheData(config['expire_cache_data'])
+
+            myid = createPeerID()
+            random.seed(myid)
+
+            doneflag = threading.Event()
+
+            def disp_exception(text):
+                print(text)
+            rawserver = RawServer(
+                doneflag, config['timeout_check_interval'], config['timeout'],
+                ipv6_enable=config['ipv6_enabled'], failfunc=h.failed,
+                errorfunc=disp_exception)
+            upnp_type = UPnP_test(config['upnp_nat_access'])
+            while True:
+                try:
+                    listen_port = rawserver.find_and_bind(
+                        config['minport'], config['maxport'], config['bind'],
+                        ipv6_socket_style=config['ipv6_binds_v4'],
+                        upnp=upnp_type, randomizer=config['random_port'])
+                    break
+                except socket.error as e:
+                    if upnp_type and e == UPnP_ERROR:
+                        print('WARNING: COULD NOT FORWARD VIA UPnP')
+                        upnp_type = 0
+                        continue
+                    print("error: Couldn't listen - ", e)
+                    h.failed()
+                    return
+
+            metainfo = get_metainfo(config['metafile'], config['url'], h.error)
+            if not metainfo:
+                break
+
+            infohash = hashlib.sha1(bencode(metainfo['info'])).digest()
+
+            dow = BT1Download(
+                h.display, h.finished, h.error, disp_exception, doneflag, config,
+                metainfo, infohash, myid, rawserver, listen_port, configdir)
+
+            if not dow.saveAs(h.chooseFile, h.newpath):
+                break
+
+            if not dow.initFiles(old_style=True):
+                break
+            if not dow.startEngine():
+                dow.shutdown()
+                break
+            dow.startRerequester()
+            dow.autoStats()
+
+            if not dow.am_I_finished():
+                h.display(activity='connecting to peers')
+            rawserver.listen_forever(dow.getPortHandler())
+            h.display(activity='shutting down')
+            dow.shutdown()
+            break
+        try:
+            rawserver.shutdown()
+        except Exception:
+            pass
+        if not h.done:
+            h.failed()
 
 def run(params):
     h = HeadlessDisplayer()
-    while 1:
-        configdir = ConfigDir('downloadheadless')
-        defaultsToIgnore = ['metafile', 'url', 'priority']
-        configdir.setDefaults(defaults, defaultsToIgnore)
-        configdefaults = configdir.loadConfig()
-        defaults.append(
-            ('save_options', 0, 'whether to save the current options as the '
-             'new default configuration (only for btdownloadheadless.py)'))
-        try:
-            config = parse_params(params, configdefaults)
-        except ValueError as e:
-            print('error: {}\n'.format(e),
-                  'run with no args for parameter explanations')
-            break
-        if not config:
-            print(get_usage(defaults, 80, configdefaults))
-            break
-        if config['save_options']:
-            configdir.saveConfig(config)
-        configdir.deleteOldCacheData(config['expire_cache_data'])
-
-        myid = createPeerID()
-        random.seed(myid)
-
-        doneflag = threading.Event()
-
-        def disp_exception(text):
-            print(text)
-        rawserver = RawServer(
-            doneflag, config['timeout_check_interval'], config['timeout'],
-            ipv6_enable=config['ipv6_enabled'], failfunc=h.failed,
-            errorfunc=disp_exception)
-        upnp_type = UPnP_test(config['upnp_nat_access'])
-        while True:
-            try:
-                listen_port = rawserver.find_and_bind(
-                    config['minport'], config['maxport'], config['bind'],
-                    ipv6_socket_style=config['ipv6_binds_v4'],
-                    upnp=upnp_type, randomizer=config['random_port'])
-                break
-            except socket.error as e:
-                if upnp_type and e == UPnP_ERROR:
-                    print('WARNING: COULD NOT FORWARD VIA UPnP')
-                    upnp_type = 0
-                    continue
-                print("error: Couldn't listen - ", e)
-                h.failed()
-                return
-
-        metainfo = get_metainfo(config['metafile'], config['url'], h.error)
-        if not metainfo:
-            break
-
-        infohash = hashlib.sha1(bencode(metainfo['info'])).digest()
-
-        dow = BT1Download(
-            h.display, h.finished, h.error, disp_exception, doneflag, config,
-            metainfo, infohash, myid, rawserver, listen_port, configdir)
-
-        if not dow.saveAs(h.chooseFile, h.newpath):
-            break
-
-        if not dow.initFiles(old_style=True):
-            break
-        if not dow.startEngine():
-            dow.shutdown()
-            break
-        dow.startRerequester()
-        dow.autoStats()
-
-        if not dow.am_I_finished():
-            h.display(activity='connecting to peers')
-        rawserver.listen_forever(dow.getPortHandler())
-        h.display(activity='shutting down')
-        dow.shutdown()
-        break
+    dthread = DownloadThread(params, h)
+    dthread.setDaemon(True)
+    dthread.start()
+    dbus.mainloop.glib.threads_init()
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    mainloop = GLib.MainLoop()
     try:
-        rawserver.shutdown()
-    except Exception:
-        pass
-    if not h.done:
-        h.failed()
+        
+        gsbtDbus = dbus.SessionBus()
+        gsbtDbus = dbus.service.BusName("com.gsidv.btdownload", gsbtDbus)
+        gsui = GSDbusBTDownload(gsbtDbus, '/com/gsidv/btdownload', h)
+        
+        mainloop.run()
+
+    except KeyboardInterrupt:
+        mainloop.quit()
+        print("mainloop quit")
+
+
 
 if __name__ == '__main__':
     if sys.argv[1:] == ['--version']:
